@@ -110,8 +110,8 @@ require (
 	github.com/getsentry/sentry-go v0.28.1
 	github.com/golang-jwt/jwt/v4 v4.5.0
 	github.com/google/uuid v1.6.0
+	github.com/harshitashankar/jsonDiff v0.0.4
 	github.com/jackc/pgproto3/v2 v2.3.2
-	github.com/keploy/jsonDiff v1.0.5
 	github.com/sbabiv/xml2map v1.2.1
 	github.com/shirou/gopsutil/v3 v3.24.3
 	github.com/spf13/viper v1.19.0
