@@ -175,7 +175,7 @@ type (
 func SetByPassPorts(conf *Config, ports []uint) {
 	for _, port := range ports {
 		conf.BypassRules = append(conf.BypassRules, BypassRule{
-			Path: "",
+			Path: "/health",
 			Host: "",
 			Port: port,
 		})
