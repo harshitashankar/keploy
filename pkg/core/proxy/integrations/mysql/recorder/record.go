@@ -96,15 +96,10 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 		return nil
 	})
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errCh:
-		if err == io.EOF {
-			return nil
-		}
-		return err
-	}
+	// Return immediately instead of blocking - let the goroutine handle the connection lifecycle
+	// The error group will be waited on in the defer function of handleConnection
+	// This allows handleConnection to return immediately, preventing connection pool timeouts
+	return nil
 }
 
 func recordMock(ctx context.Context, requests []mysql.Request, responses []mysql.Response, mockType, requestOperation, responseOperation string, mocks chan<- *models.Mock, reqTimestampMock time.Time) {
