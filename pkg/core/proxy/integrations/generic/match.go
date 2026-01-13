@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"regexp"
 
 	"go.keploy.io/server/v2/pkg"
 	"go.keploy.io/server/v2/pkg/core/proxy/integrations"
@@ -14,6 +15,19 @@ import (
 	"go.keploy.io/server/v2/pkg/core/proxy/integrations/util"
 	"go.keploy.io/server/v2/pkg/models"
 )
+
+// maskUUIDs replaces UUID patterns in the byte array with a placeholder
+// UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 characters)
+// This is a temporary fix to ignore UUID differences in matching
+func maskUUIDs(data []byte) []byte {
+	// UUID regex pattern: 8 hex digits, hyphen, 4 hex digits, hyphen, 4 hex digits, hyphen, 4 hex digits, hyphen, 12 hex digits
+	uuidPattern := regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	
+	// Convert to string, mask UUIDs, convert back to bytes
+	str := string(data)
+	masked := uuidPattern.ReplaceAllString(str, "00000000-0000-0000-0000-000000000000")
+	return []byte(masked)
+}
 
 // fuzzyMatch performs a fuzzy matching algorithm to find the best matching mock for the given request.
 // It takes a context, a request buffer, and a mock database as input parameters.
@@ -120,9 +134,13 @@ func findBinaryMatch(tcsMocks []*models.Mock, reqBuffs [][]byte, mxSim float64) 
 }
 
 func fuzzyCheck(encoded, reqBuf []byte) float64 {
-	k := util.AdaptiveK(len(reqBuf), 3, 8, 5)
-	shingles1 := util.CreateShingles(encoded, k)
-	shingles2 := util.CreateShingles(reqBuf, k)
+	// Mask UUIDs before comparison to ignore UUID differences
+	encodedMasked := maskUUIDs(encoded)
+	reqBufMasked := maskUUIDs(reqBuf)
+	
+	k := util.AdaptiveK(len(reqBufMasked), 3, 8, 5)
+	shingles1 := util.CreateShingles(encodedMasked, k)
+	shingles2 := util.CreateShingles(reqBufMasked, k)
 	similarity := util.JaccardSimilarity(shingles1, shingles2)
 	return similarity
 }
@@ -133,14 +151,35 @@ func findExactMatch(tcsMocks []*models.Mock, reqBuffs [][]byte) int {
 			matched := true // Flag to track if all requests match
 
 			for requestIndex, reqBuff := range reqBuffs {
-
+				// Get mock data
+				mockData := mock.Spec.GenericRequests[requestIndex].Message[0].Data
+				mockType := mock.Spec.GenericRequests[requestIndex].Message[0].Type
+				
+				// Decode mock data if it's binary
+				var mockBytes []byte
+				if mockType == "binary" {
+					mockBytes, _ = util.DecodeBase64(mockData)
+				} else {
+					mockBytes = []byte(mockData)
+				}
+				
+				// Prepare request bytes for comparison
+				var reqBytes []byte
 				bufStr := string(reqBuff)
 				if !util.IsASCII(string(reqBuff)) {
+					// If not ASCII, compare as base64 encoded
 					bufStr = util.EncodeBase64(reqBuff)
+					reqBytes = []byte(bufStr)
+				} else {
+					reqBytes = reqBuff
 				}
-
-				// Compare the encoded data
-				if mock.Spec.GenericRequests[requestIndex].Message[0].Data != bufStr {
+				
+				// Mask UUIDs in both before comparison
+				mockMasked := maskUUIDs(mockBytes)
+				reqMasked := maskUUIDs(reqBytes)
+				
+				// Compare masked data
+				if string(mockMasked) != string(reqMasked) {
 					matched = false
 					break // Exit the loop if any request doesn't match
 				}
