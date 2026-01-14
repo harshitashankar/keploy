@@ -2,11 +2,13 @@ package mockdb
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 
 	"go.keploy.io/server/v2/pkg/models"
 	"go.keploy.io/server/v2/pkg/models/mysql"
+	"go.keploy.io/server/v2/pkg/models/pulsar"
 	"go.keploy.io/server/v2/pkg/platform/yaml"
 	"go.keploy.io/server/v2/utils"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
@@ -298,6 +300,19 @@ func decodeMocks(yamlMocks []*yaml.NetworkTrafficDoc, logger *zap.Logger) ([]*mo
 			}
 
 			mockSpec, err := decodeMySQLMessage(context.Background(), logger, &mySQLSpec)
+			if err != nil {
+				return nil, err
+			}
+			mock.Spec = *mockSpec
+		case models.PULSAR:
+			pulsarSpec := pulsar.Spec{}
+			err := m.Spec.Decode(&pulsarSpec)
+			if err != nil {
+				utils.LogError(logger, err, "failed to unmarshal a yaml doc into pulsar mock", zap.String("mock name", m.Name))
+				return nil, err
+			}
+
+			mockSpec, err := decodePulsarMessage(context.Background(), logger, &pulsarSpec)
 			if err != nil {
 				return nil, err
 			}
@@ -618,6 +633,95 @@ func decodeMySQLMessage(_ context.Context, logger *zap.Logger, yamlSpec *mysql.S
 	}
 
 	mockSpec.MySQLResponses = responses
+
+	return &mockSpec, nil
+}
+
+func decodePulsarMessage(_ context.Context, logger *zap.Logger, yamlSpec *pulsar.Spec) (*models.MockSpec, error) {
+	mockSpec := models.MockSpec{
+		Metadata:         yamlSpec.Metadata,
+		Created:          yamlSpec.CreatedAt,
+		ReqTimestampMock: yamlSpec.ReqTimestampMock,
+		ResTimestampMock: yamlSpec.ResTimestampMock,
+	}
+
+	// Decode the requests
+	requests := []pulsar.Request{}
+	for _, v := range yamlSpec.Requests {
+		// Decode base64 payload and raw packet
+		var payload []byte
+		var rawPacket []byte
+		var err error
+
+		if v.Payload != "" {
+			payload, err = base64.StdEncoding.DecodeString(v.Payload)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode pulsar request payload", zap.String("mock_name", yamlSpec.Metadata["name"]))
+				return nil, err
+			}
+		}
+
+		if v.RawPacket != "" {
+			rawPacket, err = base64.StdEncoding.DecodeString(v.RawPacket)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode pulsar request raw packet", zap.String("mock_name", yamlSpec.Metadata["name"]))
+				return nil, err
+			}
+		}
+
+		req := pulsar.Request{
+			CommandType: v.CommandType,
+			Topic:       v.Topic,
+			ProducerID:  v.ProducerID,
+			ConsumerID:  v.ConsumerID,
+			RequestID:   v.RequestID,
+			MessageID:   v.MessageID,
+			Payload:     payload,
+			Metadata:    v.Metadata,
+			RawPacket:   rawPacket,
+		}
+		requests = append(requests, req)
+	}
+
+	// Decode the responses
+	responses := []pulsar.Response{}
+	for _, v := range yamlSpec.Responses {
+		// Decode base64 payload and raw packet
+		var payload []byte
+		var rawPacket []byte
+		var err error
+
+		if v.Payload != "" {
+			payload, err = base64.StdEncoding.DecodeString(v.Payload)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode pulsar response payload", zap.String("mock_name", yamlSpec.Metadata["name"]))
+				return nil, err
+			}
+		}
+
+		if v.RawPacket != "" {
+			rawPacket, err = base64.StdEncoding.DecodeString(v.RawPacket)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode pulsar response raw packet", zap.String("mock_name", yamlSpec.Metadata["name"]))
+				return nil, err
+			}
+		}
+
+		resp := pulsar.Response{
+			CommandType: v.CommandType,
+			RequestID:   v.RequestID,
+			ProducerID:  v.ProducerID,
+			ConsumerID:  v.ConsumerID,
+			MessageID:   v.MessageID,
+			Payload:     payload,
+			Metadata:    v.Metadata,
+			RawPacket:   rawPacket,
+		}
+		responses = append(responses, resp)
+	}
+
+	mockSpec.PulsarRequests = requests
+	mockSpec.PulsarResponses = responses
 
 	return &mockSpec, nil
 }

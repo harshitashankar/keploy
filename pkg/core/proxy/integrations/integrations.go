@@ -25,6 +25,7 @@ const (
 	POSTGRES_V2 IntegrationType = "postgres_v2"
 	MONGO       IntegrationType = "mongo"
 	REDIS       IntegrationType = "redis"
+	PULSAR      IntegrationType = "pulsar"
 )
 
 type Parsers struct {
