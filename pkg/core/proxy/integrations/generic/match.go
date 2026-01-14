@@ -22,7 +22,7 @@ import (
 func maskUUIDs(data []byte) []byte {
 	// UUID regex pattern: 8 hex digits, hyphen, 4 hex digits, hyphen, 4 hex digits, hyphen, 4 hex digits, hyphen, 12 hex digits
 	uuidPattern := regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	
+
 	// Convert to string, mask UUIDs, convert back to bytes
 	str := string(data)
 	masked := uuidPattern.ReplaceAllString(str, "00000000-0000-0000-0000-000000000000")
@@ -137,7 +137,7 @@ func fuzzyCheck(encoded, reqBuf []byte) float64 {
 	// Mask UUIDs before comparison to ignore UUID differences
 	encodedMasked := maskUUIDs(encoded)
 	reqBufMasked := maskUUIDs(reqBuf)
-	
+
 	k := util.AdaptiveK(len(reqBufMasked), 3, 8, 5)
 	shingles1 := util.CreateShingles(encodedMasked, k)
 	shingles2 := util.CreateShingles(reqBufMasked, k)
@@ -154,7 +154,7 @@ func findExactMatch(tcsMocks []*models.Mock, reqBuffs [][]byte) int {
 				// Get mock data
 				mockData := mock.Spec.GenericRequests[requestIndex].Message[0].Data
 				mockType := mock.Spec.GenericRequests[requestIndex].Message[0].Type
-				
+
 				// Decode mock data if it's binary
 				var mockBytes []byte
 				if mockType == "binary" {
@@ -162,7 +162,7 @@ func findExactMatch(tcsMocks []*models.Mock, reqBuffs [][]byte) int {
 				} else {
 					mockBytes = []byte(mockData)
 				}
-				
+
 				// Prepare request bytes for comparison
 				var reqBytes []byte
 				bufStr := string(reqBuff)
@@ -173,11 +173,11 @@ func findExactMatch(tcsMocks []*models.Mock, reqBuffs [][]byte) int {
 				} else {
 					reqBytes = reqBuff
 				}
-				
+
 				// Mask UUIDs in both before comparison
 				mockMasked := maskUUIDs(mockBytes)
 				reqMasked := maskUUIDs(reqBytes)
-				
+
 				// Compare masked data
 				if string(mockMasked) != string(reqMasked) {
 					matched = false
