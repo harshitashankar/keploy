@@ -507,6 +507,16 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 		return err
 	}
 
+	// Ensure we have at least 10 bytes for Pulsar detection
+	// If we got less, try reading more (but only if it's not EOF)
+	if len(initialBuf) < 10 && err == nil {
+		// Try to read a bit more for protocol detection
+		additionalBuf, readErr := util.ReadBytes(parserCtx, p.logger, srcConn)
+		if readErr == nil && len(additionalBuf) > 0 {
+			initialBuf = append(initialBuf, additionalBuf...)
+		}
+	}
+
 	if util.IsHTTPReq(initialBuf) && !util.HasCompleteHTTPHeaders(initialBuf) {
 		// HTTP headers are never chunked according to the HTTP protocol,
 		// but at the TCP layer, we cannot be sure if we have received the entire

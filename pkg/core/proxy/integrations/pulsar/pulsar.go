@@ -40,38 +40,73 @@ func New(logger *zap.Logger) integrations.Integrations {
 // Pulsar packets start with: [4-byte length header][protobuf-encoded BaseCommand]
 // We check for the protobuf pattern indicating CONNECT or CONNECTED commands
 func (p *Pulsar) MatchType(ctx context.Context, buf []byte) bool {
-	// Minimum size check
-	if len(buf) < 8 {
+	// Minimum size check - need at least 4 bytes for length header
+	if len(buf) < 4 {
 		return false
 	}
 
 	// Read length header (first 4 bytes, big-endian)
 	totalLength := binary.BigEndian.Uint32(buf[0:4])
 
-	// Validate length
-	if totalLength < 8 || totalLength > 10*1024*1024 { // 10MB max
+	// Validate length - Pulsar packets typically range from ~10 bytes to a few MB
+	if totalLength < 4 || totalLength > 10*1024*1024 { // 10MB max
 		return false
 	}
 
-	// Check for Pulsar protobuf pattern: look for CONNECT command
+	// Ensure we have enough buffer to check the payload
+	// We need at least the length header + some payload bytes
+	if len(buf) < 8 {
+		// Buffer too small, but length header looks valid - could be Pulsar
+		// Request more data by returning false for now, but this shouldn't happen
+		// as ReadInitialBuf should read enough
+		return false
+	}
+
+	// Check for Pulsar protobuf pattern
 	// Protobuf field tag for BaseCommand.type: 08 (field 1, wire type 0 = varint)
-	// CONNECT value: 02 (varint-encoded 2)
-	// CONNECTED value: 03 (varint-encoded 3)
-	// Pattern: 08 02 or 08 03 appears early in protobuf payload (after length header)
-	if len(buf) >= 10 {
-		// Check bytes 4-5 for protobuf field tag + CONNECT/CONNECTED value
-		if buf[4] == 0x08 {
-			// Check for CONNECT (value 2) or CONNECTED (value 3)
-			if buf[5] == 0x02 || buf[5] == 0x03 {
-				p.logger.Debug("Detected Pulsar protocol", zap.Uint8("command_type", buf[5]))
+	// We need to search for this pattern anywhere in the first few bytes of payload
+	// since protobuf fields can be in any order
+
+	// Search for protobuf field tag 0x08 in the first 20 bytes of payload
+	// This covers most Pulsar command packets
+	payloadStart := 4
+	searchEnd := payloadStart + 20
+	if searchEnd > len(buf) {
+		searchEnd = len(buf)
+	}
+
+	for i := payloadStart; i < searchEnd-1; i++ {
+		// Look for protobuf field tag 0x08 (BaseCommand.type)
+		if buf[i] == 0x08 {
+			// Next byte should be the command type (varint-encoded)
+			commandType := buf[i+1]
+
+			// Check for valid Pulsar command types
+			// CONNECT=2, CONNECTED=3, SUBSCRIBE=4, PRODUCER=5, SEND=6, etc.
+			if commandType >= 0x02 && commandType <= 0x28 {
+				p.logger.Debug("Detected Pulsar protocol",
+					zap.Uint8("command_type", commandType),
+					zap.Int("payload_offset", i),
+					zap.Uint32("total_length", totalLength))
 				return true
 			}
-			// Also check for other common Pulsar commands (PRODUCER=5, SUBSCRIBE=4, etc.)
-			// These might appear if we're detecting mid-connection
-			if buf[5] >= 0x04 && buf[5] <= 0x14 { // Common command range
-				// Additional validation: check if this looks like valid protobuf
-				// For now, accept it as potential Pulsar
-				p.logger.Debug("Detected potential Pulsar protocol", zap.Uint8("command_type", buf[5]))
+		}
+	}
+
+	// Additional check: if the length header is valid and the packet structure
+	// looks like Pulsar (has reasonable size), we can be more lenient
+	// This helps catch cases where the command type field appears later
+	if totalLength >= 8 && totalLength <= 10000 && len(buf) >= int(totalLength) {
+		// Check if the entire packet structure looks valid
+		// Pulsar packets should have protobuf-encoded data after the length header
+		// Look for common protobuf patterns in the payload
+		for i := payloadStart; i < len(buf)-1 && i < payloadStart+50; i++ {
+			if buf[i] == 0x08 || buf[i] == 0x0A || buf[i] == 0x12 {
+				// Found protobuf field tags - likely protobuf-encoded
+				// Combined with valid length header, this is likely Pulsar
+				p.logger.Debug("Detected potential Pulsar protocol based on protobuf structure",
+					zap.Uint32("total_length", totalLength),
+					zap.Uint8("protobuf_tag", buf[i]))
 				return true
 			}
 		}
