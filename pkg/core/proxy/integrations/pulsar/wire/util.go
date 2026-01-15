@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 
@@ -16,6 +17,13 @@ import (
 // ReadPacketBuffer reads a Pulsar packet from the connection
 // Pulsar packet format: [4-byte length header (big-endian)][protobuf payload]
 func ReadPacketBuffer(ctx context.Context, logger *zap.Logger, conn net.Conn) ([]byte, error) {
+	// Check context first
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	var packetBuffer []byte
 
 	// Read the 4-byte length header
@@ -24,7 +32,7 @@ func ReadPacketBuffer(ctx context.Context, logger *zap.Logger, conn net.Conn) ([
 		if err == io.EOF {
 			return nil, err
 		}
-		return packetBuffer, err
+		return packetBuffer, fmt.Errorf("failed to read packet header: %w", err)
 	}
 
 	packetBuffer = append(packetBuffer, header...)
@@ -41,9 +49,9 @@ func ReadPacketBuffer(ctx context.Context, logger *zap.Logger, conn net.Conn) ([
 		payload, err := util.ReadRequiredBytes(ctx, logger, conn, int(payloadLength))
 		if err != nil {
 			if err == io.EOF {
-				return nil, err
+				return nil, fmt.Errorf("unexpected EOF while reading payload (expected %d bytes): %w", payloadLength, err)
 			}
-			return packetBuffer, err
+			return packetBuffer, fmt.Errorf("failed to read packet payload: %w", err)
 		}
 		packetBuffer = append(packetBuffer, payload...)
 	}

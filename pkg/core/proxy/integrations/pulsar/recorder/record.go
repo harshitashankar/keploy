@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -98,46 +99,68 @@ type handshakeResult struct {
 func handleInitialHandshake(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, opts models.OutgoingOptions) (*handshakeResult, error) {
 	reqTimestamp := time.Now()
 
+	// Validate connections
+	if clientConn == nil {
+		return nil, errors.New("client connection is nil")
+	}
+	if destConn == nil {
+		return nil, errors.New("destination connection is nil")
+	}
+
+	logger.Debug("Starting Pulsar handshake",
+		zap.String("clientAddr", clientConn.RemoteAddr().String()),
+		zap.String("destAddr", destConn.RemoteAddr().String()))
+
 	// Read CONNECT command from client
 	clientPacket, err := wire.ReadPacketBuffer(ctx, logger, clientConn)
 	if err != nil {
-		return nil, err
+		utils.LogError(logger, err, "failed to read CONNECT packet from client")
+		return nil, fmt.Errorf("failed to read CONNECT: %w", err)
 	}
 
+	logger.Debug("Read CONNECT packet", zap.Int("size", len(clientPacket)))
+
 	// Forward to destination
-	_, err = destConn.Write(clientPacket)
+	n, err := destConn.Write(clientPacket)
 	if err != nil {
 		utils.LogError(logger, err, "failed to forward CONNECT to destination")
-		return nil, err
+		return nil, fmt.Errorf("failed to forward CONNECT: %w", err)
 	}
+	logger.Debug("Forwarded CONNECT packet", zap.Int("bytes", n))
 
 	// Decode request
 	req, err := wire.DecodePacket(ctx, logger, clientPacket, decodeCtx)
 	if err != nil {
 		utils.LogError(logger, err, "failed to decode CONNECT packet")
-		return nil, err
+		return nil, fmt.Errorf("failed to decode CONNECT: %w", err)
 	}
 
 	requests := []pulsar.Request{*req}
 
 	// Read CONNECTED response from server
+	logger.Debug("Reading CONNECTED response from server")
 	serverPacket, err := wire.ReadPacketBuffer(ctx, logger, destConn)
 	if err != nil {
-		return nil, err
+		utils.LogError(logger, err, "failed to read CONNECTED response from server",
+			zap.String("error", err.Error()))
+		return nil, fmt.Errorf("failed to read CONNECTED: %w", err)
 	}
 
+	logger.Debug("Read CONNECTED packet", zap.Int("size", len(serverPacket)))
+
 	// Forward to client
-	_, err = clientConn.Write(serverPacket)
+	n, err = clientConn.Write(serverPacket)
 	if err != nil {
 		utils.LogError(logger, err, "failed to forward CONNECTED to client")
-		return nil, err
+		return nil, fmt.Errorf("failed to forward CONNECTED: %w", err)
 	}
+	logger.Debug("Forwarded CONNECTED packet", zap.Int("bytes", n))
 
 	// Decode response
 	resp, err := wire.DecodeResponse(ctx, logger, serverPacket, decodeCtx)
 	if err != nil {
 		utils.LogError(logger, err, "failed to decode CONNECTED packet")
-		return nil, err
+		return nil, fmt.Errorf("failed to decode CONNECTED: %w", err)
 	}
 
 	responses := []pulsar.Response{*resp}
