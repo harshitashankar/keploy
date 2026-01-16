@@ -138,11 +138,15 @@ func handleInitialHandshake(ctx context.Context, logger *zap.Logger, clientConn,
 	requests := []pulsar.Request{*req}
 
 	// Read CONNECTED response from server
-	logger.Debug("Reading CONNECTED response from server")
+	logger.Debug("Reading CONNECTED response from server",
+		zap.String("destConnLocalAddr", destConn.LocalAddr().String()),
+		zap.String("destConnRemoteAddr", destConn.RemoteAddr().String()))
 	serverPacket, err := wire.ReadPacketBuffer(ctx, logger, destConn)
 	if err != nil {
 		utils.LogError(logger, err, "failed to read CONNECTED response from server",
-			zap.String("error", err.Error()))
+			zap.String("error", err.Error()),
+			zap.String("destConnLocalAddr", destConn.LocalAddr().String()),
+			zap.String("destConnRemoteAddr", destConn.RemoteAddr().String()))
 		return nil, fmt.Errorf("failed to read CONNECTED: %w", err)
 	}
 

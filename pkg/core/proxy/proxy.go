@@ -592,6 +592,11 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 				utils.LogError(logger, err, "failed to dial the conn to destination server", zap.Uint32("proxy port", p.Port), zap.String("server address", dstAddr))
 				return err
 			}
+			// Log successful connection establishment
+			logger.Debug("Successfully established destination connection",
+				zap.String("destAddr", dstAddr),
+				zap.String("localAddr", dstConn.LocalAddr().String()),
+				zap.String("remoteAddr", dstConn.RemoteAddr().String()))
 		}
 		dstCfg.Addr = dstAddr
 	}
