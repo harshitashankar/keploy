@@ -128,6 +128,13 @@ func handleInitialHandshake(ctx context.Context, logger *zap.Logger, clientConn,
 	}
 	logger.Debug("Forwarded CONNECT packet", zap.Int("bytes", n))
 
+	// Ensure the write is flushed (TCP connections should flush automatically, but explicit flush for safety)
+	if tcpConn, ok := destConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			logger.Debug("Failed to set TCP_NODELAY, continuing anyway", zap.Error(err))
+		}
+	}
+
 	// Decode request
 	req, err := wire.DecodePacket(ctx, logger, clientPacket, decodeCtx)
 	if err != nil {
