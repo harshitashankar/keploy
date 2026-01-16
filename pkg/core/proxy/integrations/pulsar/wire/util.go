@@ -17,13 +17,6 @@ import (
 // ReadPacketBuffer reads a Pulsar packet from the connection
 // Pulsar packet format: [4-byte length header (big-endian)][protobuf payload]
 func ReadPacketBuffer(ctx context.Context, logger *zap.Logger, conn net.Conn) ([]byte, error) {
-	// Check context first
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
 	var packetBuffer []byte
 
 	// Read the 4-byte length header
