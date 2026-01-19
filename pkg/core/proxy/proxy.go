@@ -457,6 +457,50 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 		return nil
 	}
 
+	// Check for Pulsar port (6650)
+	isPulsarPort := destInfo.Port == 6650
+	if isPulsarPort {
+		if rule.Mode != models.MODE_TEST {
+			dstConn, err = net.Dial("tcp", dstAddr)
+			if err != nil {
+				utils.LogError(p.logger, err, "failed to dial Pulsar destination server", zap.Uint32("proxy port", p.Port), zap.String("server address", dstAddr))
+				return err
+			}
+
+			dstCfg := &models.ConditionalDstCfg{
+				Port: uint(destInfo.Port),
+			}
+			rule.DstCfg = dstCfg
+
+			// Record the outgoing message into a mock
+			err := p.Integrations[integrations.PULSAR].RecordOutgoing(parserCtx, srcConn, dstConn, rule.MC, rule.OutgoingOptions)
+			if err != nil {
+				utils.LogError(p.logger, err, "failed to record the outgoing Pulsar message")
+				return err
+			}
+			return nil
+		}
+
+		m, ok := p.MockManagers.Load(destInfo.AppID)
+		if !ok {
+			utils.LogError(p.logger, nil, "failed to fetch the mock manager", zap.Uint64("AppID", destInfo.AppID))
+			return err
+		}
+
+		// Mock the outgoing message
+		err := p.Integrations[integrations.PULSAR].MockOutgoing(parserCtx, srcConn, &models.ConditionalDstCfg{Addr: dstAddr}, m.(*MockManager), rule.OutgoingOptions)
+		if err != nil && err != io.EOF && !errors.Is(err, context.Canceled) {
+			utils.LogError(p.logger, err, "failed to mock the outgoing Pulsar message")
+			proxyErr := models.ParserError{
+				ParserErrorType: models.ErrMockNotFound,
+				Err:             err,
+			}
+			p.SendError(proxyErr)
+			return err
+		}
+		return nil
+	}
+
 	reader := bufio.NewReader(srcConn)
 	initialData := make([]byte, 5)
 	// reading the initial data from the client connection to determine if the connection is a TLS handshake

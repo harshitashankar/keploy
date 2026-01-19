@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"go.keploy.io/server/v2/pkg/models/mysql"
+	"go.keploy.io/server/v2/pkg/models/pulsar"
 )
 
 type Kind string
@@ -16,6 +17,7 @@ const (
 	Postgres    Kind = "Postgres"
 	GRPC_EXPORT Kind = "gRPC"
 	Mongo       Kind = "Mongo"
+	PULSAR      Kind = "Pulsar"
 )
 
 type Mock struct {
@@ -54,6 +56,8 @@ type MockSpec struct {
 	GRPCResp          *GrpcResp         `json:"grpcResponse,omitempty" bson:"grpc_resp,omitempty"`
 	MySQLRequests     []mysql.Request   `json:"MySqlRequests,omitempty" bson:"my_sql_requests,omitempty"`
 	MySQLResponses    []mysql.Response  `json:"MySqlResponses,omitempty" bson:"my_sql_responses,omitempty"`
+	PulsarRequests    []pulsar.Request  `json:"PulsarRequests,omitempty" bson:"pulsar_requests,omitempty"`
+	PulsarResponses   []pulsar.Response `json:"PulsarResponses,omitempty" bson:"pulsar_responses,omitempty"`
 	ReqTimestampMock  time.Time         `json:"ReqTimestampMock,omitempty" bson:"req_timestamp_mock,omitempty"`
 	ResTimestampMock  time.Time         `json:"ResTimestampMock,omitempty" bson:"res_timestamp_mock,omitempty"`
 }
@@ -141,6 +145,12 @@ func (m *Mock) DeepCopy() *Mock {
 
 	c.Spec.MySQLResponses = make([]mysql.Response, len(m.Spec.MySQLResponses))
 	copy(c.Spec.MySQLResponses, m.Spec.MySQLResponses)
+
+	c.Spec.PulsarRequests = make([]pulsar.Request, len(m.Spec.PulsarRequests))
+	copy(c.Spec.PulsarRequests, m.Spec.PulsarRequests)
+
+	c.Spec.PulsarResponses = make([]pulsar.Response, len(m.Spec.PulsarResponses))
+	copy(c.Spec.PulsarResponses, m.Spec.PulsarResponses)
 
 	// 4. Deep copy all pointers by creating a new object and copying the value.
 	if m.Spec.HTTPReq != nil {

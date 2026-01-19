@@ -7,10 +7,12 @@ import (
 
 	"go.keploy.io/server/v2/pkg/models"
 	"go.keploy.io/server/v2/pkg/models/mysql"
+	"go.keploy.io/server/v2/pkg/models/pulsar"
 	"go.keploy.io/server/v2/pkg/platform/yaml"
 	"go.keploy.io/server/v2/utils"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
 	"go.uber.org/zap"
+	yamlLib "gopkg.in/yaml.v3"
 )
 
 func EncodeMock(mock *models.Mock, logger *zap.Logger) (*yaml.NetworkTrafficDoc, error) {
@@ -175,6 +177,51 @@ func EncodeMock(mock *models.Mock, logger *zap.Logger) (*yaml.NetworkTrafficDoc,
 			utils.LogError(logger, err, "failed to marshal the MySQL input-output as yaml")
 			return nil, err
 		}
+	case models.PULSAR:
+		requests := []pulsar.RequestYaml{}
+		for _, v := range mock.Spec.PulsarRequests {
+			req := pulsar.RequestYaml{
+				Header:    v.Header,
+				Timestamp: v.Timestamp,
+			}
+			// Encode message to YAML node
+			var msgNode yamlLib.Node
+			if err := msgNode.Encode(v.Message); err != nil {
+				utils.LogError(logger, err, "failed to encode pulsar request message into yaml")
+				return nil, err
+			}
+			req.Message = msgNode
+			requests = append(requests, req)
+		}
+		responses := []pulsar.ResponseYaml{}
+		for _, v := range mock.Spec.PulsarResponses {
+			resp := pulsar.ResponseYaml{
+				Header:    v.Header,
+				Timestamp: v.Timestamp,
+			}
+			// Encode message to YAML node
+			var msgNode yamlLib.Node
+			if err := msgNode.Encode(v.Message); err != nil {
+				utils.LogError(logger, err, "failed to encode pulsar response message into yaml")
+				return nil, err
+			}
+			resp.Message = msgNode
+			responses = append(responses, resp)
+		}
+
+		pulsarSpec := pulsar.Spec{
+			Metadata:         mock.Spec.Metadata,
+			Requests:         requests,
+			Responses:        responses,
+			CreatedAt:        mock.Spec.Created,
+			ReqTimestampMock: mock.Spec.ReqTimestampMock,
+			ResTimestampMock: mock.Spec.ResTimestampMock,
+		}
+		err := yamlDoc.Spec.Encode(pulsarSpec)
+		if err != nil {
+			utils.LogError(logger, err, "failed to marshal the Pulsar input-output as yaml")
+			return nil, err
+		}
 	default:
 		utils.LogError(logger, nil, "failed to marshal the recorded mock into yaml due to invalid kind of mock")
 		return nil, errors.New("type of mock is invalid")
@@ -302,6 +349,52 @@ func decodeMocks(yamlMocks []*yaml.NetworkTrafficDoc, logger *zap.Logger) ([]*mo
 				return nil, err
 			}
 			mock.Spec = *mockSpec
+		case models.PULSAR:
+			pulsarSpec := pulsar.Spec{}
+			err := m.Spec.Decode(&pulsarSpec)
+			if err != nil {
+				utils.LogError(logger, err, "failed to unmarshal a yaml doc into pulsar mock", zap.String("mock name", m.Name))
+				return nil, err
+			}
+
+			requests := []pulsar.Request{}
+			for _, v := range pulsarSpec.Requests {
+				var msg interface{}
+				if err := v.Message.Decode(&msg); err != nil {
+					utils.LogError(logger, err, "failed to decode pulsar request message from yaml")
+					return nil, err
+				}
+				req := pulsar.Request{
+					Header:    v.Header,
+					Message:   msg,
+					Timestamp: v.Timestamp,
+				}
+				requests = append(requests, req)
+			}
+
+			responses := []pulsar.Response{}
+			for _, v := range pulsarSpec.Responses {
+				var msg interface{}
+				if err := v.Message.Decode(&msg); err != nil {
+					utils.LogError(logger, err, "failed to decode pulsar response message from yaml")
+					return nil, err
+				}
+				resp := pulsar.Response{
+					Header:    v.Header,
+					Message:   msg,
+					Timestamp: v.Timestamp,
+				}
+				responses = append(responses, resp)
+			}
+
+			mock.Spec = models.MockSpec{
+				Metadata:          pulsarSpec.Metadata,
+				PulsarRequests:    requests,
+				PulsarResponses:   responses,
+				Created:           pulsarSpec.CreatedAt,
+				ReqTimestampMock:  pulsarSpec.ReqTimestampMock,
+				ResTimestampMock:  pulsarSpec.ResTimestampMock,
+			}
 		default:
 			utils.LogError(logger, nil, "failed to unmarshal a mock yaml doc of unknown type", zap.String("type", string(m.Kind)))
 			continue
