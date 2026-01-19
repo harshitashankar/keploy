@@ -98,11 +98,14 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 		return errors.New("failed to get error group from context")
 	}
 
+	logger.Debug("Starting concurrent reading from client and destination")
+
 	// Start reading from client concurrently
 	g.Go(func() error {
 		defer pUtil.Recover(logger, clientConn, destConn)
 		defer close(clientBuffChan)
-		readPulsarPackets(ctx, logger, clientConn, clientBuffChan, errChan)
+		logger.Debug("Starting readPulsarPackets for client connection")
+		readPulsarPackets(ctx, logger, clientConn, clientBuffChan, errChan, "client")
 		return nil
 	})
 
@@ -110,7 +113,8 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 	g.Go(func() error {
 		defer pUtil.Recover(logger, clientConn, destConn)
 		defer close(destBuffChan)
-		readPulsarPackets(ctx, logger, destConn, destBuffChan, errChan)
+		logger.Debug("Starting readPulsarPackets for destination connection")
+		readPulsarPackets(ctx, logger, destConn, destBuffChan, errChan, "destination")
 		return nil
 	})
 
@@ -127,8 +131,11 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 		case clientPacket, ok := <-clientBuffChan:
 			if !ok {
 				// Channel closed, connection ended
+				logger.Debug("Client buffer channel closed")
 				return nil
 			}
+
+			logger.Debug("Received packet from client", zap.Int("size", len(clientPacket)))
 
 			// Forward request to destination
 			_, err := destConn.Write(clientPacket)
@@ -153,8 +160,11 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 		case serverPacket, ok := <-destBuffChan:
 			if !ok {
 				// Channel closed, connection ended
+				logger.Debug("Destination buffer channel closed")
 				return nil
 			}
+
+			logger.Debug("Received packet from destination", zap.Int("size", len(serverPacket)))
 
 			// Forward response to client
 			_, err := clientConn.Write(serverPacket)
@@ -172,6 +182,7 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 
 			// Record handshake mock on first response (CONNECTED)
 			if !handshakeRecorded {
+				logger.Debug("Recording handshake mock (CONNECT/CONNECTED)")
 				recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*resp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
 				handshakeRecorded = true
 				prevChunkWasReq = false
@@ -189,7 +200,9 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 			logger.Debug("Received and forwarded response from server")
 
 		case err := <-errChan:
+			logger.Debug("Received error from readPulsarPackets", zap.Error(err))
 			if err == io.EOF {
+				logger.Debug("EOF received, closing connection")
 				return nil
 			}
 			if err != nil {
@@ -201,30 +214,41 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 }
 
 // readPulsarPackets continuously reads Pulsar packets from a connection and sends them to a channel
-func readPulsarPackets(ctx context.Context, logger *zap.Logger, conn net.Conn, bufferChannel chan []byte, errChannel chan error) {
+func readPulsarPackets(ctx context.Context, logger *zap.Logger, conn net.Conn, bufferChannel chan []byte, errChannel chan error, connType string) {
+	logger.Debug("readPulsarPackets started", zap.String("connType", connType), zap.String("remoteAddr", conn.RemoteAddr().String()))
+	defer logger.Debug("readPulsarPackets exiting", zap.String("connType", connType))
+
 	for {
 		select {
 		case <-ctx.Done():
+			logger.Debug("readPulsarPackets: context cancelled", zap.String("connType", connType))
 			return
 		default:
 			if conn == nil {
-				logger.Debug("connection is nil")
+				logger.Debug("connection is nil", zap.String("connType", connType))
 				return
 			}
 
+			logger.Debug("readPulsarPackets: attempting to read packet", zap.String("connType", connType))
 			packet, err := wire.ReadPacketBuffer(ctx, logger, conn)
 			if err != nil {
+				logger.Debug("readPulsarPackets: read error", zap.String("connType", connType), zap.Error(err))
 				if ctx.Err() != nil {
+					logger.Debug("readPulsarPackets: context error", zap.String("connType", connType), zap.Error(ctx.Err()))
 					return
 				}
 				if err != io.EOF {
-					utils.LogError(logger, err, "failed to read Pulsar packet")
+					utils.LogError(logger, err, "failed to read Pulsar packet", zap.String("connType", connType))
+				} else {
+					logger.Debug("readPulsarPackets: EOF received", zap.String("connType", connType))
 				}
 				errChannel <- err
 				return
 			}
 
+			logger.Debug("readPulsarPackets: successfully read packet", zap.String("connType", connType), zap.Int("size", len(packet)))
 			if ctx.Err() != nil {
+				logger.Debug("readPulsarPackets: context error after read", zap.String("connType", connType))
 				return
 			}
 
