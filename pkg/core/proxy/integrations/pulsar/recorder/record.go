@@ -5,7 +5,6 @@ package recorder
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -22,11 +21,6 @@ import (
 
 // Record records Pulsar traffic between client and destination
 func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
-	var (
-		requests  []pulsar.Request
-		responses []pulsar.Response
-	)
-
 	errCh := make(chan error, 1)
 
 	g, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
@@ -42,28 +36,47 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 			Mode: string(models.MODE_RECORD),
 		}
 
-		// Handle initial handshake (CONNECT/CONNECTED)
-		result, err := handleInitialHandshake(ctx, logger, clientConn, destConn, decodeCtx, opts)
+		// Read initial CONNECT packet
+		initialPacket, err := wire.ReadPacketBuffer(ctx, logger, clientConn)
 		if err != nil {
-			utils.LogError(logger, err, "failed to handle initial handshake")
+			utils.LogError(logger, err, "failed to read initial CONNECT packet")
 			errCh <- err
 			return nil
 		}
 
-		requests = append(requests, result.req...)
-		responses = append(responses, result.resp...)
+		logger.Debug("Read initial CONNECT packet", zap.Int("size", len(initialPacket)))
 
-		reqTimestamp := result.reqTimestamp
+		// Set TCP_NODELAY on both connections
+		if tcpConn, ok := destConn.(*net.TCPConn); ok {
+			if err := tcpConn.SetNoDelay(true); err != nil {
+				logger.Debug("Failed to set TCP_NODELAY on destConn, continuing anyway", zap.Error(err))
+			}
+		}
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			if err := tcpConn.SetNoDelay(true); err != nil {
+				logger.Debug("Failed to set TCP_NODELAY on clientConn, continuing anyway", zap.Error(err))
+			}
+		}
 
-		// Record handshake mock
-		recordMock(ctx, requests, responses, "config", result.requestOperation, result.responseOperation, mocks, reqTimestamp)
+		// Write initial CONNECT packet to destination immediately
+		_, err = destConn.Write(initialPacket)
+		if err != nil {
+			utils.LogError(logger, err, "failed to forward CONNECT to destination")
+			errCh <- err
+			return nil
+		}
+		logger.Debug("Forwarded CONNECT packet", zap.Int("bytes", len(initialPacket)))
 
-		// Reset for data phase
-		requests = []pulsar.Request{}
-		responses = []pulsar.Response{}
+		// Decode initial request
+		initialReq, err := wire.DecodePacket(ctx, logger, initialPacket, decodeCtx)
+		if err != nil {
+			utils.LogError(logger, err, "failed to decode CONNECT packet")
+			errCh <- err
+			return nil
+		}
 
-		// Handle subsequent commands (PRODUCER, SEND, etc.) using concurrent reading
-		return handleClientCommandsConcurrent(ctx, logger, clientConn, destConn, decodeCtx, mocks, opts)
+		// Now start concurrent reading - CONNECTED will arrive naturally through destBuffChan
+		return handleConcurrentTraffic(ctx, logger, clientConn, destConn, decodeCtx, initialReq, mocks, opts)
 	})
 
 	select {
@@ -74,105 +87,8 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 	}
 }
 
-type handshakeResult struct {
-	req               []pulsar.Request
-	resp              []pulsar.Response
-	reqTimestamp      time.Time
-	requestOperation  string
-	responseOperation string
-}
-
-func handleInitialHandshake(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, opts models.OutgoingOptions) (*handshakeResult, error) {
-	reqTimestamp := time.Now()
-
-	if clientConn == nil {
-		return nil, errors.New("client connection is nil")
-	}
-	if destConn == nil {
-		return nil, errors.New("destination connection is nil")
-	}
-
-	logger.Debug("Starting Pulsar handshake",
-		zap.String("clientAddr", clientConn.RemoteAddr().String()),
-		zap.String("destAddr", destConn.RemoteAddr().String()))
-
-	// Set TCP_NODELAY on destination connection before reading/writing
-	if tcpConn, ok := destConn.(*net.TCPConn); ok {
-		if err := tcpConn.SetNoDelay(true); err != nil {
-			logger.Debug("Failed to set TCP_NODELAY on destConn, continuing anyway", zap.Error(err))
-		}
-	}
-	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-		if err := tcpConn.SetNoDelay(true); err != nil {
-			logger.Debug("Failed to set TCP_NODELAY on clientConn, continuing anyway", zap.Error(err))
-		}
-	}
-
-	// Read CONNECT command from client
-	clientPacket, err := wire.ReadPacketBuffer(ctx, logger, clientConn)
-	if err != nil {
-		utils.LogError(logger, err, "failed to read CONNECT packet from client")
-		return nil, fmt.Errorf("failed to read CONNECT: %w", err)
-	}
-
-	logger.Debug("Read CONNECT packet", zap.Int("size", len(clientPacket)))
-
-	// Forward to destination
-	n, err := destConn.Write(clientPacket)
-	if err != nil {
-		utils.LogError(logger, err, "failed to forward CONNECT to destination")
-		return nil, fmt.Errorf("failed to forward CONNECT: %w", err)
-	}
-	logger.Debug("Forwarded CONNECT packet", zap.Int("bytes", n))
-
-	// Decode request
-	req, err := wire.DecodePacket(ctx, logger, clientPacket, decodeCtx)
-	if err != nil {
-		utils.LogError(logger, err, "failed to decode CONNECT packet")
-		return nil, fmt.Errorf("failed to decode CONNECT: %w", err)
-	}
-
-	requests := []pulsar.Request{*req}
-
-	// Read CONNECTED response from server
-	logger.Debug("Reading CONNECTED response from server")
-
-	serverPacket, err := wire.ReadPacketBuffer(ctx, logger, destConn)
-	if err != nil {
-		utils.LogError(logger, err, "failed to read CONNECTED response from server")
-		return nil, fmt.Errorf("failed to read CONNECTED: %w", err)
-	}
-
-	logger.Debug("Read CONNECTED packet", zap.Int("size", len(serverPacket)))
-
-	// Forward to client
-	n, err = clientConn.Write(serverPacket)
-	if err != nil {
-		utils.LogError(logger, err, "failed to forward CONNECTED to client")
-		return nil, fmt.Errorf("failed to forward CONNECTED: %w", err)
-	}
-	logger.Debug("Forwarded CONNECTED packet", zap.Int("bytes", n))
-
-	// Decode response
-	resp, err := wire.DecodeResponse(ctx, logger, serverPacket, decodeCtx)
-	if err != nil {
-		utils.LogError(logger, err, "failed to decode CONNECTED packet")
-		return nil, fmt.Errorf("failed to decode CONNECTED: %w", err)
-	}
-
-	responses := []pulsar.Response{*resp}
-
-	return &handshakeResult{
-		req:               requests,
-		resp:              responses,
-		reqTimestamp:      reqTimestamp,
-		requestOperation:  "CONNECT",
-		responseOperation: "CONNECTED",
-	}, nil
-}
-
-// handleClientCommandsConcurrent handles subsequent Pulsar commands using concurrent reading
-func handleClientCommandsConcurrent(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
+// handleConcurrentTraffic handles all Pulsar traffic concurrently (including CONNECTED response)
+func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, initialReq *pulsar.Request, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
 	clientBuffChan := make(chan []byte)
 	destBuffChan := make(chan []byte)
 	errChan := make(chan error, 2)
@@ -201,6 +117,8 @@ func handleClientCommandsConcurrent(ctx context.Context, logger *zap.Logger, cli
 	var currentReq *pulsar.Request
 	var reqTimestamp time.Time
 	prevChunkWasReq := false
+	handshakeRecorded := false
+	initialReqTimestamp := time.Now()
 
 	for {
 		select {
@@ -249,6 +167,15 @@ func handleClientCommandsConcurrent(ctx context.Context, logger *zap.Logger, cli
 			resp, err := wire.DecodeResponse(ctx, logger, serverPacket, decodeCtx)
 			if err != nil {
 				utils.LogError(logger, err, "failed to decode response packet")
+				continue
+			}
+
+			// Record handshake mock on first response (CONNECTED)
+			if !handshakeRecorded {
+				recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*resp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
+				handshakeRecorded = true
+				prevChunkWasReq = false
+				logger.Debug("Recorded handshake mock (CONNECT/CONNECTED)")
 				continue
 			}
 
