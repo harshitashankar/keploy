@@ -75,8 +75,41 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 			return nil
 		}
 
-		// Now start concurrent reading - CONNECTED will arrive naturally through destBuffChan
-		return handleConcurrentTraffic(ctx, logger, clientConn, destConn, decodeCtx, initialReq, mocks, opts)
+		initialReqTimestamp := time.Now()
+
+		// Read CONNECTED immediately after forwarding CONNECT (broker expects immediate read)
+		logger.Debug("Reading CONNECTED response immediately after CONNECT")
+		connectedPacket, err := wire.ReadPacketBuffer(ctx, logger, destConn)
+		if err != nil {
+			utils.LogError(logger, err, "failed to read CONNECTED response from server")
+			errCh <- err
+			return nil
+		}
+		logger.Debug("Read CONNECTED packet", zap.Int("size", len(connectedPacket)))
+
+		// Forward CONNECTED to client immediately
+		_, err = clientConn.Write(connectedPacket)
+		if err != nil {
+			utils.LogError(logger, err, "failed to forward CONNECTED to client")
+			errCh <- err
+			return nil
+		}
+		logger.Debug("Forwarded CONNECTED packet", zap.Int("bytes", len(connectedPacket)))
+
+		// Decode CONNECTED response
+		connectedResp, err := wire.DecodeResponse(ctx, logger, connectedPacket, decodeCtx)
+		if err != nil {
+			utils.LogError(logger, err, "failed to decode CONNECTED packet")
+			errCh <- err
+			return nil
+		}
+
+		// Record handshake mock
+		logger.Debug("Recording handshake mock (CONNECT/CONNECTED)")
+		recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*connectedResp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
+
+		// Now start concurrent reading for subsequent packets
+		return handleConcurrentTraffic(ctx, logger, clientConn, destConn, decodeCtx, mocks, opts)
 	})
 
 	select {
@@ -87,8 +120,8 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 	}
 }
 
-// handleConcurrentTraffic handles all Pulsar traffic concurrently (including CONNECTED response)
-func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, initialReq *pulsar.Request, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
+// handleConcurrentTraffic handles subsequent Pulsar traffic concurrently (after handshake is complete)
+func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
 	clientBuffChan := make(chan []byte)
 	destBuffChan := make(chan []byte)
 	errChan := make(chan error, 2)
@@ -121,8 +154,6 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 	var currentReq *pulsar.Request
 	var reqTimestamp time.Time
 	prevChunkWasReq := false
-	handshakeRecorded := false
-	initialReqTimestamp := time.Now()
 
 	for {
 		select {
@@ -177,16 +208,6 @@ func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn
 			resp, err := wire.DecodeResponse(ctx, logger, serverPacket, decodeCtx)
 			if err != nil {
 				utils.LogError(logger, err, "failed to decode response packet")
-				continue
-			}
-
-			// Record handshake mock on first response (CONNECTED)
-			if !handshakeRecorded {
-				logger.Debug("Recording handshake mock (CONNECT/CONNECTED)")
-				recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*resp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
-				handshakeRecorded = true
-				prevChunkWasReq = false
-				logger.Debug("Recorded handshake mock (CONNECT/CONNECTED)")
 				continue
 			}
 
