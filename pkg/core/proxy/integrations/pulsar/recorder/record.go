@@ -4,9 +4,7 @@ package recorder
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -38,17 +36,7 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 			Mode: string(models.MODE_RECORD),
 		}
 
-		// Read initial CONNECT packet
-		initialPacket, err := wire.ReadPacketBuffer(ctx, logger, clientConn)
-		if err != nil {
-			utils.LogError(logger, err, "failed to read initial CONNECT packet")
-			errCh <- err
-			return nil
-		}
-
-		logger.Debug("Read initial CONNECT packet", zap.Int("size", len(initialPacket)))
-
-		// Set TCP_NODELAY on both connections
+		// Set TCP_NODELAY on both connections BEFORE any reads/writes
 		if tcpConn, ok := destConn.(*net.TCPConn); ok {
 			if err := tcpConn.SetNoDelay(true); err != nil {
 				logger.Debug("Failed to set TCP_NODELAY on destConn, continuing anyway", zap.Error(err))
@@ -59,6 +47,32 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 				logger.Debug("Failed to set TCP_NODELAY on clientConn, continuing anyway", zap.Error(err))
 			}
 		}
+
+		// Start reading CONNECTED in a goroutine BEFORE writing CONNECT
+		// This ensures we're ready to receive CONNECTED as soon as broker sends it
+		connectedChan := make(chan []byte, 1)
+		connectedErrChan := make(chan error, 1)
+		g.Go(func() error {
+			defer pUtil.Recover(logger, clientConn, destConn)
+			logger.Debug("Starting to read CONNECTED response")
+			connectedPacket, err := wire.ReadPacketBuffer(ctx, logger, destConn)
+			if err != nil {
+				connectedErrChan <- err
+				return nil
+			}
+			connectedChan <- connectedPacket
+			return nil
+		})
+
+		// Read initial CONNECT packet
+		initialPacket, err := wire.ReadPacketBuffer(ctx, logger, clientConn)
+		if err != nil {
+			utils.LogError(logger, err, "failed to read initial CONNECT packet")
+			errCh <- err
+			return nil
+		}
+
+		logger.Debug("Read initial CONNECT packet", zap.Int("size", len(initialPacket)))
 
 		// Write initial CONNECT packet to destination immediately
 		_, err = destConn.Write(initialPacket)
@@ -79,66 +93,43 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 
 		initialReqTimestamp := time.Now()
 
-		// Read CONNECTED response using ReadBytes (like HTTP does)
-		// This reads until EOF/timeout, then we'll parse it as a Pulsar packet
-		logger.Debug("Reading CONNECTED response immediately after CONNECT")
-		connectedData, err := pUtil.ReadBytes(ctx, logger, destConn)
-		if err != nil {
-			if err == io.EOF {
-				// EOF means connection closed, but check if we got any data first
-				if len(connectedData) == 0 {
-					utils.LogError(logger, err, "broker closed connection without sending CONNECTED")
-					errCh <- err
-					return nil
-				}
-				// We got some data before EOF, continue processing
-				logger.Debug("Received CONNECTED before EOF", zap.Int("bytes", len(connectedData)))
-			} else {
-				utils.LogError(logger, err, "failed to read CONNECTED response from server")
+		// Wait for CONNECTED response (already being read in goroutine)
+		logger.Debug("Waiting for CONNECTED response")
+		select {
+		case connectedPacket := <-connectedChan:
+			logger.Debug("Read CONNECTED packet", zap.Int("size", len(connectedPacket)))
+
+			// Forward CONNECTED to client immediately
+			_, err = clientConn.Write(connectedPacket)
+			if err != nil {
+				utils.LogError(logger, err, "failed to forward CONNECTED to client")
 				errCh <- err
 				return nil
 			}
-		}
+			logger.Debug("Forwarded CONNECTED packet", zap.Int("bytes", len(connectedPacket)))
 
-		// Parse the CONNECTED packet from the data we read
-		// ReadBytes might read more than one packet, so we need to extract just the first packet
-		connectedPacket, err := extractFirstPacket(connectedData, logger)
-		if err != nil {
-			utils.LogError(logger, err, "failed to extract CONNECTED packet from response data")
+			// Decode CONNECTED response
+			connectedResp, err := wire.DecodeResponse(ctx, logger, connectedPacket, decodeCtx)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode CONNECTED packet")
+				errCh <- err
+				return nil
+			}
+
+			// Record handshake mock
+			logger.Debug("Recording handshake mock (CONNECT/CONNECTED)")
+			recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*connectedResp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
+
+			// Now start concurrent reading for subsequent packets
+			return handleConcurrentTraffic(ctx, logger, clientConn, destConn, decodeCtx, mocks, opts)
+
+		case err := <-connectedErrChan:
+			utils.LogError(logger, err, "failed to read CONNECTED response from server")
 			errCh <- err
 			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		logger.Debug("Read CONNECTED packet", zap.Int("size", len(connectedPacket)))
-
-		// Forward CONNECTED to client immediately
-		_, err = clientConn.Write(connectedPacket)
-		if err != nil {
-			utils.LogError(logger, err, "failed to forward CONNECTED to client")
-			errCh <- err
-			return nil
-		}
-		logger.Debug("Forwarded CONNECTED packet", zap.Int("bytes", len(connectedPacket)))
-
-		// Decode CONNECTED response
-		connectedResp, err := wire.DecodeResponse(ctx, logger, connectedPacket, decodeCtx)
-		if err != nil {
-			utils.LogError(logger, err, "failed to decode CONNECTED packet")
-			errCh <- err
-			return nil
-		}
-
-		// Record handshake mock
-		logger.Debug("Recording handshake mock (CONNECT/CONNECTED)")
-		recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*connectedResp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
-
-		// If we read more than one packet, log it (remaining data will be handled by concurrent reader)
-		if len(connectedData) > len(connectedPacket) {
-			logger.Debug("Received additional data after CONNECTED", zap.Int("remaining_bytes", len(connectedData)-len(connectedPacket)))
-			// Note: The remaining data will be picked up by the concurrent reader if the connection stays open
-		}
-
-		// Now start concurrent reading for subsequent packets
-		return handleConcurrentTraffic(ctx, logger, clientConn, destConn, decodeCtx, mocks, opts)
 	})
 
 	select {
@@ -305,28 +296,6 @@ func readPulsarPackets(ctx context.Context, logger *zap.Logger, conn net.Conn, b
 			bufferChannel <- packet
 		}
 	}
-}
-
-// extractFirstPacket extracts the first complete Pulsar packet from the data buffer
-func extractFirstPacket(data []byte, logger *zap.Logger) ([]byte, error) {
-	if len(data) < 4 {
-		return nil, fmt.Errorf("data too short for Pulsar packet header: got %d bytes", len(data))
-	}
-
-	// Read the length header (first 4 bytes, big-endian)
-	totalLength := binary.BigEndian.Uint32(data[0:4])
-
-	if totalLength < 4 {
-		return nil, fmt.Errorf("invalid packet length: %d (must be at least 4)", totalLength)
-	}
-
-	// Check if we have the complete packet
-	if len(data) < int(totalLength) {
-		return nil, fmt.Errorf("incomplete packet: expected %d bytes, got %d", totalLength, len(data))
-	}
-
-	// Return the first complete packet
-	return data[0:totalLength], nil
 }
 
 func recordMock(ctx context.Context, requests []pulsar.Request, responses []pulsar.Response, mockType, reqOp, respOp string, mocks chan<- *models.Mock, reqTimestamp time.Time) {
