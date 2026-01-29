@@ -89,6 +89,11 @@ func IsHTTPReq(buf []byte) bool {
 	return isHTTP
 }
 
+// IsPulsarMessage checks if the destination port is the Pulsar port (6650)
+func IsPulsarMessage(destPort uint32) bool {
+	return destPort == 6650
+}
+
 // ReadBuffConn is used to read the buffer from the connection
 func ReadBuffConn(ctx context.Context, logger *zap.Logger, conn net.Conn, bufferChannel chan []byte, errChannel chan error) {
 	//TODO: where to close the errChannel

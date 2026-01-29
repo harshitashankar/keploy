@@ -32,9 +32,13 @@ func New(logger *zap.Logger) integrations.Integrations {
 	}
 }
 
-func (p *Pulsar) MatchType(_ context.Context, _ []byte) bool {
-	// Returning false because Pulsar parser uses port-based detection (port 6650)
-	return false
+func (p *Pulsar) MatchType(ctx context.Context, _ []byte) bool {
+	// Check if destination port is Pulsar port (6650) from context
+	destPort, ok := ctx.Value(models.DestPortKey).(uint32)
+	if !ok {
+		return false
+	}
+	return destPort == 6650
 }
 
 func (p *Pulsar) RecordOutgoing(ctx context.Context, src net.Conn, dst net.Conn, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
