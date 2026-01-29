@@ -10,6 +10,7 @@ import (
 	"go.keploy.io/server/v2/pkg/core/proxy/integrations"
 	"go.keploy.io/server/v2/pkg/core/proxy/integrations/pulsar/recorder"
 	"go.keploy.io/server/v2/pkg/core/proxy/integrations/pulsar/replayer"
+	"go.keploy.io/server/v2/pkg/core/proxy/util"
 	"go.keploy.io/server/v2/pkg/models"
 	"go.keploy.io/server/v2/utils"
 	"go.uber.org/zap"
@@ -48,7 +49,14 @@ func (p *Pulsar) RecordOutgoing(ctx context.Context, src net.Conn, dst net.Conn,
 		zap.Any("Client IP Address", src.RemoteAddr().String()),
 	)
 
-	err := recorder.Record(ctx, logger, src, dst, mocks, opts)
+	p.logger.Debug("Recording the outgoing Pulsar call in record mode")
+
+	reqBuf, err := util.ReadInitialBuf(ctx, logger, src)
+	if err != nil {
+		utils.LogError(logger, err, "failed to read the initial Pulsar message")
+		return err
+	}
+	err = recorder.Record(ctx, logger, reqBuf, src, dst, mocks, opts)
 	if err != nil {
 		utils.LogError(logger, err, "failed to record Pulsar messages")
 		return err

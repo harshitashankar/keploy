@@ -20,7 +20,7 @@ import (
 )
 
 // Record records Pulsar traffic between client and destination
-func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
+func Record(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn, destConn net.Conn, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
 	errCh := make(chan error, 1)
 
 	g, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
@@ -36,7 +36,7 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 			Mode: string(models.MODE_RECORD),
 		}
 
-		// Set TCP_NODELAY on both connections BEFORE any reads/writes
+		// Set TCP_NODELAY on both connections
 		if tcpConn, ok := destConn.(*net.TCPConn); ok {
 			if err := tcpConn.SetNoDelay(true); err != nil {
 				logger.Debug("Failed to set TCP_NODELAY on destConn, continuing anyway", zap.Error(err))
@@ -48,253 +48,131 @@ func Record(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Co
 			}
 		}
 
-		// Start reading CONNECTED in a goroutine BEFORE writing CONNECT
-		// This ensures we're ready to receive CONNECTED as soon as broker sends it
-		connectedChan := make(chan []byte, 1)
-		connectedErrChan := make(chan error, 1)
-		g.Go(func() error {
-			defer pUtil.Recover(logger, clientConn, destConn)
-			logger.Debug("Starting to read CONNECTED response")
-			connectedPacket, err := wire.ReadPacketBuffer(ctx, logger, destConn)
-			if err != nil {
-				connectedErrChan <- err
-				return nil
-			}
-			connectedChan <- connectedPacket
-			return nil
-		})
-
-		// Read initial CONNECT packet
-		initialPacket, err := wire.ReadPacketBuffer(ctx, logger, clientConn)
+		// Write initial buffer (CONNECT packet) to destination immediately - same as HTTP
+		_, err := destConn.Write(reqBuf)
 		if err != nil {
-			utils.LogError(logger, err, "failed to read initial CONNECT packet")
+			utils.LogError(logger, err, "failed to write request message to the destination server")
 			errCh <- err
 			return nil
 		}
 
-		logger.Debug("Read initial CONNECT packet", zap.Int("size", len(initialPacket)))
-
-		// Write initial CONNECT packet to destination immediately
-		_, err = destConn.Write(initialPacket)
-		if err != nil {
-			utils.LogError(logger, err, "failed to forward CONNECT to destination")
-			errCh <- err
-			return nil
-		}
-		logger.Debug("Forwarded CONNECT packet", zap.Int("bytes", len(initialPacket)))
-
-		// Decode initial request
-		initialReq, err := wire.DecodePacket(ctx, logger, initialPacket, decodeCtx)
-		if err != nil {
-			utils.LogError(logger, err, "failed to decode CONNECT packet")
-			errCh <- err
-			return nil
-		}
-
-		initialReqTimestamp := time.Now()
-
-		// Wait for CONNECTED response (already being read in goroutine)
-		logger.Debug("Waiting for CONNECTED response")
-		select {
-		case connectedPacket := <-connectedChan:
-			logger.Debug("Read CONNECTED packet", zap.Int("size", len(connectedPacket)))
-
-			// Forward CONNECTED to client immediately
-			_, err = clientConn.Write(connectedPacket)
-			if err != nil {
-				utils.LogError(logger, err, "failed to forward CONNECTED to client")
-				errCh <- err
-				return nil
-			}
-			logger.Debug("Forwarded CONNECTED packet", zap.Int("bytes", len(connectedPacket)))
-
-			// Decode CONNECTED response
-			connectedResp, err := wire.DecodeResponse(ctx, logger, connectedPacket, decodeCtx)
-			if err != nil {
-				utils.LogError(logger, err, "failed to decode CONNECTED packet")
-				errCh <- err
-				return nil
-			}
-
-			// Record handshake mock
-			logger.Debug("Recording handshake mock (CONNECT/CONNECTED)")
-			recordMock(ctx, []pulsar.Request{*initialReq}, []pulsar.Response{*connectedResp}, "config", "CONNECT", "CONNECTED", mocks, initialReqTimestamp)
-
-			// Now start concurrent reading for subsequent packets
-			return handleConcurrentTraffic(ctx, logger, clientConn, destConn, decodeCtx, mocks, opts)
-
-		case err := <-connectedErrChan:
-			utils.LogError(logger, err, "failed to read CONNECTED response from server")
-			errCh <- err
-			return nil
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		logger.Debug("This is the initial request", zap.Int("size", len(reqBuf)))
+		var finalReq []byte
+		finalReq = append(finalReq, reqBuf...)
+
+		// Now handle responses and subsequent requests in a loop (same as HTTP)
+		for {
+			// Capture request timestamp
+			reqTimestampMock := time.Now()
+
+			// Read response from destination
+			resp, err := pUtil.ReadBytes(ctx, logger, destConn)
+			if err != nil {
+				if err == io.EOF {
+					logger.Debug("Response complete, exiting the loop.")
+					// If there is any buffer left before EOF, we must send it to the client and save this as mock
+					if len(resp) != 0 {
+						// Write response to client
+						_, err = clientConn.Write(resp)
+						if err != nil {
+							if ctx.Err() != nil {
+								return ctx.Err()
+							}
+							utils.LogError(logger, err, "failed to write response message to the user client")
+							errCh <- err
+							return nil
+						}
+
+						// Decode and record mock
+						req, decodeErr := wire.DecodePacket(ctx, logger, finalReq, decodeCtx)
+						respDecoded, respDecodeErr := wire.DecodeResponse(ctx, logger, resp, decodeCtx)
+						if decodeErr == nil && respDecodeErr == nil {
+							recordMock(ctx, []pulsar.Request{*req}, []pulsar.Response{*respDecoded}, "data", "COMMAND", "RESPONSE", mocks, reqTimestampMock)
+						}
+					}
+					break
+				}
+				utils.LogError(logger, err, "failed to read the response message from the destination server")
+				errCh <- err
+				return nil
+			}
+
+			// Write response to client
+			_, err = clientConn.Write(resp)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				utils.LogError(logger, err, "failed to write response message to the user client")
+				errCh <- err
+				return nil
+			}
+
+			var finalResp []byte
+			finalResp = append(finalResp, resp...)
+			logger.Debug("This is the initial response", zap.Int("size", len(resp)))
+
+			// Decode request and response
+			req, err := wire.DecodePacket(ctx, logger, finalReq, decodeCtx)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode request packet")
+				// Continue even if decode fails
+			}
+
+			respDecoded, err := wire.DecodeResponse(ctx, logger, finalResp, decodeCtx)
+			if err != nil {
+				utils.LogError(logger, err, "failed to decode response packet")
+				// Continue even if decode fails
+			}
+
+			// Record mock if both decoded successfully
+			if req != nil && respDecoded != nil {
+				recordMock(ctx, []pulsar.Request{*req}, []pulsar.Response{*respDecoded}, "data", "COMMAND", "RESPONSE", mocks, reqTimestampMock)
+			}
+
+			// Reset for next request/response
+			finalReq = []byte("")
+			finalResp = []byte("")
+
+			// Read next request from client (keep connection alive - same as HTTP)
+			logger.Debug("Reading the request from the user client again from the same connection")
+			finalReq, err = pUtil.ReadBytes(ctx, logger, clientConn)
+			if err != nil {
+				if err != io.EOF {
+					logger.Debug("failed to read the request message from the user client", zap.Error(err))
+					errCh <- nil
+					return nil
+				}
+				errCh <- err
+				return nil
+			}
+
+			// Write request to destination
+			_, err = destConn.Write(finalReq)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				utils.LogError(logger, err, "failed to write request message to the destination server")
+				errCh <- err
+				return nil
+			}
+		}
+		return nil
 	})
 
 	select {
-	case err := <-errCh:
-		return err
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-}
-
-// handleConcurrentTraffic handles subsequent Pulsar traffic concurrently (after handshake is complete)
-func handleConcurrentTraffic(ctx context.Context, logger *zap.Logger, clientConn, destConn net.Conn, decodeCtx *wire.DecodeContext, mocks chan<- *models.Mock, opts models.OutgoingOptions) error {
-	clientBuffChan := make(chan []byte)
-	destBuffChan := make(chan []byte)
-	errChan := make(chan error, 2)
-
-	g, ok := ctx.Value(models.ErrGroupKey).(*errgroup.Group)
-	if !ok {
-		return errors.New("failed to get error group from context")
-	}
-
-	logger.Debug("Starting concurrent reading from client and destination")
-
-	// Start reading from client concurrently
-	g.Go(func() error {
-		defer pUtil.Recover(logger, clientConn, destConn)
-		defer close(clientBuffChan)
-		logger.Debug("Starting readPulsarPackets for client connection")
-		readPulsarPackets(ctx, logger, clientConn, clientBuffChan, errChan, "client")
-		return nil
-	})
-
-	// Start reading from destination concurrently
-	g.Go(func() error {
-		defer pUtil.Recover(logger, clientConn, destConn)
-		defer close(destBuffChan)
-		logger.Debug("Starting readPulsarPackets for destination connection")
-		readPulsarPackets(ctx, logger, destConn, destBuffChan, errChan, "destination")
-		return nil
-	})
-
-	var currentReq *pulsar.Request
-	var reqTimestamp time.Time
-	prevChunkWasReq := false
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case clientPacket, ok := <-clientBuffChan:
-			if !ok {
-				// Channel closed, connection ended
-				logger.Debug("Client buffer channel closed")
-				return nil
-			}
-
-			logger.Debug("Received packet from client", zap.Int("size", len(clientPacket)))
-
-			// Forward request to destination
-			_, err := destConn.Write(clientPacket)
-			if err != nil {
-				utils.LogError(logger, err, "failed to forward command to destination")
-				return err
-			}
-
-			// Decode request
-			req, err := wire.DecodePacket(ctx, logger, clientPacket, decodeCtx)
-			if err != nil {
-				utils.LogError(logger, err, "failed to decode command packet")
-				continue
-			}
-
-			currentReq = req
-			reqTimestamp = time.Now()
-			prevChunkWasReq = true
-
-			logger.Debug("Received and forwarded command from client")
-
-		case serverPacket, ok := <-destBuffChan:
-			if !ok {
-				// Channel closed, connection ended
-				logger.Debug("Destination buffer channel closed")
-				return nil
-			}
-
-			logger.Debug("Received packet from destination", zap.Int("size", len(serverPacket)))
-
-			// Forward response to client
-			_, err := clientConn.Write(serverPacket)
-			if err != nil {
-				utils.LogError(logger, err, "failed to forward response to client")
-				return err
-			}
-
-			// Decode response
-			resp, err := wire.DecodeResponse(ctx, logger, serverPacket, decodeCtx)
-			if err != nil {
-				utils.LogError(logger, err, "failed to decode response packet")
-				continue
-			}
-
-			// Record mock if we have both request and response
-			if prevChunkWasReq && currentReq != nil {
-				recordMock(ctx, []pulsar.Request{*currentReq}, []pulsar.Response{*resp}, "data", "COMMAND", "RESPONSE", mocks, reqTimestamp)
-				currentReq = nil
-				prevChunkWasReq = false
-			}
-
-			logger.Debug("Received and forwarded response from server")
-
-		case err := <-errChan:
-			logger.Debug("Received error from readPulsarPackets", zap.Error(err))
-			if err == io.EOF {
-				logger.Debug("EOF received, closing connection")
-				return nil
-			}
-			if err != nil {
-				utils.LogError(logger, err, "error reading Pulsar packets")
-				return err
-			}
+	case err := <-errCh:
+		if err == io.EOF {
+			return nil
 		}
-	}
-}
-
-// readPulsarPackets continuously reads Pulsar packets from a connection and sends them to a channel
-func readPulsarPackets(ctx context.Context, logger *zap.Logger, conn net.Conn, bufferChannel chan []byte, errChannel chan error, connType string) {
-	logger.Debug("readPulsarPackets started", zap.String("connType", connType), zap.String("remoteAddr", conn.RemoteAddr().String()))
-	defer logger.Debug("readPulsarPackets exiting", zap.String("connType", connType))
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Debug("readPulsarPackets: context cancelled", zap.String("connType", connType))
-			return
-		default:
-			if conn == nil {
-				logger.Debug("connection is nil", zap.String("connType", connType))
-				return
-			}
-
-			logger.Debug("readPulsarPackets: attempting to read packet", zap.String("connType", connType))
-			packet, err := wire.ReadPacketBuffer(ctx, logger, conn)
-			if err != nil {
-				logger.Debug("readPulsarPackets: read error", zap.String("connType", connType), zap.Error(err))
-				if ctx.Err() != nil {
-					logger.Debug("readPulsarPackets: context error", zap.String("connType", connType), zap.Error(ctx.Err()))
-					return
-				}
-				if err != io.EOF {
-					utils.LogError(logger, err, "failed to read Pulsar packet", zap.String("connType", connType))
-				} else {
-					logger.Debug("readPulsarPackets: EOF received", zap.String("connType", connType))
-				}
-				errChannel <- err
-				return
-			}
-
-			logger.Debug("readPulsarPackets: successfully read packet", zap.String("connType", connType), zap.Int("size", len(packet)))
-			if ctx.Err() != nil {
-				logger.Debug("readPulsarPackets: context error after read", zap.String("connType", connType))
-				return
-			}
-
-			bufferChannel <- packet
-		}
+		return err
 	}
 }
 
