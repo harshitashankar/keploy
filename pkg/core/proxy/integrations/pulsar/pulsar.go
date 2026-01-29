@@ -4,7 +4,6 @@ package pulsar
 
 import (
 	"context"
-	"io"
 	"net"
 
 	"go.keploy.io/server/v2/pkg/core/proxy/integrations"
@@ -71,8 +70,16 @@ func (p *Pulsar) MockOutgoing(ctx context.Context, src net.Conn, dstCfg *models.
 		zap.Any("Client IP Address", src.RemoteAddr().String()),
 	)
 
-	err := replayer.Replay(ctx, logger, src, dstCfg, mockDb, opts)
-	if err != nil && err != io.EOF {
+	p.logger.Debug("Mocking the outgoing Pulsar call in test mode")
+
+	reqBuf, err := util.ReadInitialBuf(ctx, logger, src)
+	if err != nil {
+		utils.LogError(logger, err, "failed to read the initial Pulsar message")
+		return err
+	}
+
+	err = replayer.Replay(ctx, logger, reqBuf, src, dstCfg, mockDb, opts)
+	if err != nil {
 		utils.LogError(logger, err, "failed to replay Pulsar messages")
 		return err
 	}

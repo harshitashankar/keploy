@@ -4,6 +4,8 @@ package recorder
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -91,7 +93,7 @@ func Record(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn, 
 						req, decodeErr := wire.DecodePacket(ctx, logger, finalReq, decodeCtx)
 						respDecoded, respDecodeErr := wire.DecodeResponse(ctx, logger, resp, decodeCtx)
 						if decodeErr == nil && respDecodeErr == nil {
-							recordMock(ctx, []pulsar.Request{*req}, []pulsar.Response{*respDecoded}, "data", "COMMAND", "RESPONSE", mocks, reqTimestampMock)
+							recordMock(ctx, logger, []pulsar.Request{*req}, []pulsar.Response{*respDecoded}, "data", "COMMAND", "RESPONSE", mocks, reqTimestampMock)
 						}
 					}
 					break
@@ -131,7 +133,7 @@ func Record(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn, 
 
 			// Record mock if both decoded successfully
 			if req != nil && respDecoded != nil {
-				recordMock(ctx, []pulsar.Request{*req}, []pulsar.Response{*respDecoded}, "data", "COMMAND", "RESPONSE", mocks, reqTimestampMock)
+				recordMock(ctx, logger, []pulsar.Request{*req}, []pulsar.Response{*respDecoded}, "data", "COMMAND", "RESPONSE", mocks, reqTimestampMock)
 			}
 
 			// Reset for next request/response
@@ -176,7 +178,103 @@ func Record(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn, 
 	}
 }
 
-func recordMock(ctx context.Context, requests []pulsar.Request, responses []pulsar.Response, mockType, reqOp, respOp string, mocks chan<- *models.Mock, reqTimestamp time.Time) {
+func recordMock(ctx context.Context, logger *zap.Logger, requests []pulsar.Request, responses []pulsar.Response, mockType, reqOp, respOp string, mocks chan<- *models.Mock, reqTimestamp time.Time) {
+	// Log what we're recording before encoding
+	logger.Info("Recording Pulsar mock",
+		zap.String("mockType", mockType),
+		zap.String("requestOperation", reqOp),
+		zap.String("responseOperation", respOp),
+		zap.Int("num_requests", len(requests)),
+		zap.Int("num_responses", len(responses)),
+		zap.Time("reqTimestamp", reqTimestamp),
+	)
+
+	// Log request details with raw bytes
+	for i, req := range requests {
+		// Log raw packet bytes as hex dump
+		var hexDump string
+		var firstBytes []byte
+		if req.RawPacket != nil && len(req.RawPacket) > 0 {
+			hexDump = hex.Dump(req.RawPacket)
+			// Show first 64 bytes for preview
+			if len(req.RawPacket) > 64 {
+				firstBytes = req.RawPacket[:64]
+			} else {
+				firstBytes = req.RawPacket
+			}
+		}
+
+		logger.Info("Pulsar Request details",
+			zap.Int("request_index", i),
+			zap.Any("header", req.Header),
+			zap.Int("raw_packet_size", len(req.RawPacket)),
+			zap.String("raw_packet_hex_preview", hex.EncodeToString(firstBytes)),
+			zap.String("raw_packet_hex_dump", hexDump),
+			zap.String("raw_packet_base64", func() string {
+				if req.RawPacket != nil && len(req.RawPacket) > 0 {
+					return base64.StdEncoding.EncodeToString(req.RawPacket)
+				}
+				return ""
+			}()),
+			zap.Any("message", req.Message),
+		)
+
+		// Log packet structure details
+		if req.RawPacket != nil && len(req.RawPacket) >= 4 {
+			// Parse length header (big-endian)
+			packetLength := uint32(req.RawPacket[0])<<24 | uint32(req.RawPacket[1])<<16 | uint32(req.RawPacket[2])<<8 | uint32(req.RawPacket[3])
+			logger.Debug("Request packet structure",
+				zap.Int("request_index", i),
+				zap.Uint32("packet_length_header", packetLength),
+				zap.Int("actual_packet_size", len(req.RawPacket)),
+				zap.Int("payload_size", len(req.RawPacket)-4),
+			)
+		}
+	}
+
+	// Log response details with raw bytes
+	for i, resp := range responses {
+		// Log raw packet bytes as hex dump
+		var hexDump string
+		var firstBytes []byte
+		if resp.RawPacket != nil && len(resp.RawPacket) > 0 {
+			hexDump = hex.Dump(resp.RawPacket)
+			// Show first 64 bytes for preview
+			if len(resp.RawPacket) > 64 {
+				firstBytes = resp.RawPacket[:64]
+			} else {
+				firstBytes = resp.RawPacket
+			}
+		}
+
+		logger.Info("Pulsar Response details",
+			zap.Int("response_index", i),
+			zap.Any("header", resp.Header),
+			zap.Int("raw_packet_size", len(resp.RawPacket)),
+			zap.String("raw_packet_hex_preview", hex.EncodeToString(firstBytes)),
+			zap.String("raw_packet_hex_dump", hexDump),
+			zap.String("raw_packet_base64", func() string {
+				if resp.RawPacket != nil && len(resp.RawPacket) > 0 {
+					return base64.StdEncoding.EncodeToString(resp.RawPacket)
+				}
+				return ""
+			}()),
+			zap.Any("message", resp.Message),
+		)
+
+		// Log packet structure details
+		if resp.RawPacket != nil && len(resp.RawPacket) >= 4 {
+			// Parse length header (big-endian)
+			packetLength := uint32(resp.RawPacket[0])<<24 | uint32(resp.RawPacket[1])<<16 | uint32(resp.RawPacket[2])<<8 | uint32(resp.RawPacket[3])
+			logger.Debug("Response packet structure",
+				zap.Int("response_index", i),
+				zap.Uint32("packet_length_header", packetLength),
+				zap.Int("actual_packet_size", len(resp.RawPacket)),
+				zap.Int("payload_size", len(resp.RawPacket)-4),
+			)
+		}
+	}
+
 	mock := &models.Mock{
 		Version: models.V1Beta1,
 		Kind:    models.PULSAR,
@@ -193,5 +291,14 @@ func recordMock(ctx context.Context, requests []pulsar.Request, responses []puls
 		},
 	}
 
+	logger.Info("Pulsar mock structure created",
+		zap.String("version", string(mock.Version)),
+		zap.String("kind", string(mock.Kind)),
+		zap.Any("metadata", mock.Spec.Metadata),
+		zap.Int("pulsar_requests_count", len(mock.Spec.PulsarRequests)),
+		zap.Int("pulsar_responses_count", len(mock.Spec.PulsarResponses)),
+	)
+
 	mocks <- mock
+	logger.Debug("Pulsar mock sent to mocks channel")
 }
