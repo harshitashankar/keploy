@@ -270,6 +270,8 @@ func (ys *MockYaml) GetUnFilteredMocks(ctx context.Context, testSetID string, af
 					isUnFilteredMock = true
 				case "MySQL":
 					isUnFilteredMock = true
+				case "Pulsar":
+					isUnFilteredMock = true
 				}
 				if mock.Spec.Metadata["type"] == "config" || isUnFilteredMock {
 					configMocks = append(configMocks, mock)
