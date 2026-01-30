@@ -60,6 +60,16 @@ func Replay(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn n
 			// Process current request buffer
 			logger.Debug("Processing Pulsar request", zap.Int("size", len(reqBuf)))
 
+			// Extract request ID from incoming request
+			requestID, err := wire.ExtractRequestID(reqBuf)
+			if err != nil {
+				utils.LogError(logger, err, "failed to extract request ID from request")
+				// Continue without modifying response
+				requestID = 0
+			} else {
+				logger.Debug("Extracted request ID from request", zap.Uint64("request_id", requestID))
+			}
+
 			// Find matching mock
 			if mockIndex >= len(pulsarMocks) {
 				logger.Debug("no more mocks available")
@@ -78,6 +88,19 @@ func Replay(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn n
 					utils.LogError(logger, err, "failed to encode response packet")
 					continue
 				}
+
+				// Replace request ID in response if we extracted one from the request
+				if requestID != 0 {
+					modifiedPacket, err := wire.ReplaceRequestID(packet, requestID)
+					if err != nil {
+						utils.LogError(logger, err, "failed to replace request ID in response, using original packet")
+						// Use original packet if replacement fails
+					} else {
+						packet = modifiedPacket
+						logger.Debug("Replaced request ID in response", zap.Uint64("new_request_id", requestID))
+					}
+				}
+
 				_, err = clientConn.Write(packet)
 				if err != nil {
 					if ctx.Err() != nil {
